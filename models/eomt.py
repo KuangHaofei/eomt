@@ -12,13 +12,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+from models.dinovit import DinoViT
 from models.scale_block import ScaleBlock
 
 
 class EoMT(nn.Module):
     def __init__(
         self,
-        encoder: nn.Module,
+        encoder: DinoViT,
         num_classes,
         num_q,
         num_blocks=4,
@@ -52,14 +53,18 @@ class EoMT(nn.Module):
             *[ScaleBlock(self.encoder.backbone.embed_dim) for _ in range(num_upscale)],
         )
 
+        self.num_prefix_tokens = self.encoder.backbone.num_tokens + self.encoder.backbone.num_register_tokens
+
     def _predict(self, x: torch.Tensor):
         q = x[:, : self.num_q, :]
 
         class_logits = self.class_head(q)
 
-        x = x[:, self.num_q + self.encoder.backbone.num_prefix_tokens :, :]
+        # x = x[:, self.num_q + self.encoder.backbone.num_prefix_tokens :, :]
+        x = x[:, self.num_q + self.num_prefix_tokens  :, :]
         x = x.transpose(1, 2).reshape(
-            x.shape[0], -1, *self.encoder.backbone.patch_embed.grid_size
+            # x.shape[0], -1, *self.encoder.backbone.patch_embed.grid_size
+            x.shape[0], -1, *self.encoder.path_grid_size
         )
 
         mask_logits = torch.einsum(
@@ -76,44 +81,60 @@ class EoMT(nn.Module):
                 > prob
             )
             attn_mask[
-                :, : self.num_q, self.num_q + self.encoder.backbone.num_prefix_tokens :
+                # :, : self.num_q, self.num_q + self.encoder.backbone.num_prefix_tokens :
+                :, : self.num_q, self.num_q + self.num_prefix_tokens  :
             ][random_queries] = True
 
         return attn_mask
 
+    # def _attn(self, module: nn.Module, x: torch.Tensor, mask: Optional[torch.Tensor]):
+    #     B, N, C = x.shape
+    #
+    #     qkv = module.qkv(x).reshape(B, N, 3, module.num_heads, module.head_dim)
+    #     q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+    #     q, k = module.q_norm(q), module.k_norm(k)
+    #
+    #     if mask is not None:
+    #         mask = mask[:, None, ...].expand(-1, module.num_heads, -1, -1)
+    #
+    #     dropout_p = module.attn_drop.p if self.training else 0.0
+    #
+    #     if module.fused_attn:
+    #         x = F.scaled_dot_product_attention(q, k, v, mask, dropout_p)
+    #     else:
+    #         attn = (q @ k.transpose(-2, -1)) * module.scale
+    #         if mask is not None:
+    #             attn = attn.masked_fill(~mask, float("-inf"))
+    #         attn = F.softmax(attn, dim=-1)
+    #         attn = module.attn_drop(attn)
+    #         x = attn @ v
+    #
+    #     x = module.proj_drop(module.proj(x.transpose(1, 2).reshape(B, N, C)))
+    #
+    #     return x
+
     def _attn(self, module: nn.Module, x: torch.Tensor, mask: Optional[torch.Tensor]):
         B, N, C = x.shape
-
-        qkv = module.qkv(x).reshape(B, N, 3, module.num_heads, module.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-        q, k = module.q_norm(q), module.k_norm(k)
-
+        qkv = module.qkv(x).reshape(B, N, 3, module.num_heads, C // module.num_heads)
+        q, k, v = torch.unbind(qkv, 2)
+        q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
         if mask is not None:
             mask = mask[:, None, ...].expand(-1, module.num_heads, -1, -1)
-
-        dropout_p = module.attn_drop.p if self.training else 0.0
-
-        if module.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v, mask, dropout_p)
-        else:
-            attn = (q @ k.transpose(-2, -1)) * module.scale
-            if mask is not None:
-                attn = attn.masked_fill(~mask, float("-inf"))
-            attn = F.softmax(attn, dim=-1)
-            attn = module.attn_drop(attn)
-            x = attn @ v
-
-        x = module.proj_drop(module.proj(x.transpose(1, 2).reshape(B, N, C)))
-
+        x = nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=module.attn_drop if self.training else 0
+        )
+        x = x.transpose(1, 2).contiguous().view(B, N, C)
+        x = module.proj_drop(module.proj(x))
         return x
 
     def forward(self, x: torch.Tensor):
         x = (x - self.encoder.pixel_mean) / self.encoder.pixel_std
 
-        x = self.encoder.backbone.patch_embed(x)
-        x = self.encoder.backbone._pos_embed(x)
-        x = self.encoder.backbone.patch_drop(x)
-        x = self.encoder.backbone.norm_pre(x)
+        # x = self.encoder.backbone.patch_embed(x)
+        # x = self.encoder.backbone._pos_embed(x)
+        # x = self.encoder.backbone.patch_drop(x)
+        # x = self.encoder.backbone.norm_pre(x)
+        x = self.encoder.backbone.prepare_tokens_with_masks(x)
 
         attn_mask = None
         mask_logits_per_layer, class_logits_per_layer = [], []
@@ -141,7 +162,8 @@ class EoMT(nn.Module):
                 )
                 interpolated = F.interpolate(
                     mask_logits,
-                    self.encoder.backbone.patch_embed.grid_size,
+                    # self.encoder.backbone.patch_embed.grid_size,
+                    self.encoder.path_grid_size,
                     mode="bilinear",
                 )
                 interpolated = interpolated.view(
@@ -150,7 +172,8 @@ class EoMT(nn.Module):
                 attn_mask[
                     :,
                     : self.num_q,
-                    self.num_q + self.encoder.backbone.num_prefix_tokens :,
+                    # self.num_q + self.encoder.backbone.num_prefix_tokens :,
+                    self.num_q + self.num_prefix_tokens  :,
                 ] = (
                     interpolated > 0
                 )
@@ -174,3 +197,17 @@ class EoMT(nn.Module):
             mask_logits_per_layer,
             class_logits_per_layer,
         )
+
+
+if __name__ == '__main__':
+    from models.dinovit import DinoViT
+
+    encoder = DinoViT(img_size=(672, 672))
+    model = EoMT(encoder, num_classes=133, num_q=200, num_blocks=4)
+    model.cuda()
+    model.eval()
+
+    x = torch.randn(1, 3, 672, 672).cuda()
+    mask_logits, class_logits = model(x.to(dtype=torch.float16))
+    print(mask_logits)
+    print(class_logits)
