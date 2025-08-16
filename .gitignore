@@ -1,3 +1,5 @@
+.idea/
+dinov3/
 *.ckpt
 
 _site/

@@ -51,15 +51,37 @@ class EoMT(nn.Module):
         self.upscale = nn.Sequential(
             *[ScaleBlock(self.encoder.backbone.embed_dim) for _ in range(num_upscale)],
         )
+        
+        # DINOv3特定属性：计算prefix tokens数量 (cls_token + storage_tokens)
+        self.num_prefix_tokens = 1 + self.encoder.backbone.n_storage_tokens  # cls + storage tokens
 
     def _predict(self, x: torch.Tensor):
         q = x[:, : self.num_q, :]
 
         class_logits = self.class_head(q)
 
-        x = x[:, self.num_q + self.encoder.backbone.num_prefix_tokens :, :]
+        # DINOv3适配：跳过query tokens和prefix tokens (cls + storage)
+        x = x[:, self.num_q + self.num_prefix_tokens :, :]
+        
+        # 动态计算grid_size，支持任意输入尺寸
+        patch_size = self.encoder.backbone.patch_embed.patch_size[0]  # (16, 16) -> 16
+        
+        # 从patch tokens数量推导grid_size
+        num_patch_tokens = x.shape[1]  # 去掉query和prefix tokens后的patch tokens数量
+        grid_size = int(math.sqrt(num_patch_tokens))
+        
+        # 验证是否为完全平方数
+        if grid_size * grid_size != num_patch_tokens:
+            # 如果不是完全平方数，从encoder获取图像尺寸信息
+            if hasattr(self.encoder, 'img_size'):
+                img_size = max(self.encoder.img_size)
+                grid_size = img_size // patch_size
+            else:
+                # 最后的fallback
+                grid_size = int(math.sqrt(num_patch_tokens))
+        
         x = x.transpose(1, 2).reshape(
-            x.shape[0], -1, *self.encoder.backbone.patch_embed.grid_size
+            x.shape[0], -1, grid_size, grid_size
         )
 
         mask_logits = torch.einsum(
@@ -76,62 +98,81 @@ class EoMT(nn.Module):
                 > prob
             )
             attn_mask[
-                :, : self.num_q, self.num_q + self.encoder.backbone.num_prefix_tokens :
+                :, : self.num_q, self.num_q + self.num_prefix_tokens :
             ][random_queries] = True
 
         return attn_mask
 
-    def _attn(self, module: nn.Module, x: torch.Tensor, mask: Optional[torch.Tensor]):
+    def _attn(self, module: nn.Module, x: torch.Tensor, mask: Optional[torch.Tensor], rope=None):
         B, N, C = x.shape
 
-        qkv = module.qkv(x).reshape(B, N, 3, module.num_heads, module.head_dim)
+        # 计算head_dim（DINOv3没有直接的head_dim属性）
+        head_dim = C // module.num_heads
+        
+        qkv = module.qkv(x).reshape(B, N, 3, module.num_heads, head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-        q, k = module.q_norm(q), module.k_norm(k)
+        
+        # 应用RoPE位置编码（如果提供）
+        if rope is not None:
+            q, k = module.apply_rope(q, k, rope)
 
         if mask is not None:
             mask = mask[:, None, ...].expand(-1, module.num_heads, -1, -1)
 
-        dropout_p = module.attn_drop.p if self.training else 0.0
+        # DINOv3没有fused_attn属性，使用标准attention计算
+        attn = (q @ k.transpose(-2, -1)) * module.scale
+        if mask is not None:
+            attn = attn.masked_fill(~mask, float("-inf"))
+        attn = F.softmax(attn, dim=-1)
+        attn = module.attn_drop(attn)
+        x = attn @ v
 
-        if module.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v, mask, dropout_p)
-        else:
-            attn = (q @ k.transpose(-2, -1)) * module.scale
-            if mask is not None:
-                attn = attn.masked_fill(~mask, float("-inf"))
-            attn = F.softmax(attn, dim=-1)
-            attn = module.attn_drop(attn)
-            x = attn @ v
-
-        x = module.proj_drop(module.proj(x.transpose(1, 2).reshape(B, N, C)))
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = module.proj(x)
+        x = module.proj_drop(x)
 
         return x
 
     def forward(self, x: torch.Tensor):
+        # DINOv3预处理
         x = (x - self.encoder.pixel_mean) / self.encoder.pixel_std
 
-        x = self.encoder.backbone.patch_embed(x)
-        x = self.encoder.backbone._pos_embed(x)
-        x = self.encoder.backbone.patch_drop(x)
-        x = self.encoder.backbone.norm_pre(x)
+        # 使用DINOv3的标准token准备方法，确保与原始实现完全一致
+        x, (H, W) = self.encoder.backbone.prepare_tokens_with_masks(x)
 
+        # 位置编码（DINOv3使用RoPE，在block中处理）
         attn_mask = None
         mask_logits_per_layer, class_logits_per_layer = [], []
 
         for i, block in enumerate(self.encoder.backbone.blocks):
+            # 在最后几个block中添加query tokens
             if i == len(self.encoder.backbone.blocks) - self.num_blocks:
                 x = torch.cat(
                     (self.q.weight[None, :, :].expand(x.shape[0], -1, -1), x), dim=1
                 )
 
+            # 每个block都重新计算RoPE位置编码（与DINOv3标准流程一致）
+            if self.encoder.backbone.rope_embed is not None:
+                rope_or_rope_list = self.encoder.backbone.rope_embed(H=H, W=W)
+            else:
+                rope_or_rope_list = None
+
             if (
                 self.masked_attn_enabled
                 and i >= len(self.encoder.backbone.blocks) - self.num_blocks
             ):
-                mask_logits, class_logits = self._predict(self.encoder.backbone.norm(x))
+                # 使用DINOv3的norm层
+                if hasattr(self.encoder.backbone, 'norm'):
+                    normed_x = self.encoder.backbone.norm(x)
+                else:
+                    # 如果没有全局norm，使用block的norm
+                    normed_x = x
+                    
+                mask_logits, class_logits = self._predict(normed_x)
                 mask_logits_per_layer.append(mask_logits)
                 class_logits_per_layer.append(class_logits)
 
+                # 创建attention mask
                 attn_mask = torch.ones(
                     x.shape[0],
                     x.shape[1],
@@ -139,9 +180,11 @@ class EoMT(nn.Module):
                     dtype=torch.bool,
                     device=x.device,
                 )
+                
+                # 使用实际的H, W进行插值
                 interpolated = F.interpolate(
                     mask_logits,
-                    self.encoder.backbone.patch_embed.grid_size,
+                    size=(H, W),
                     mode="bilinear",
                 )
                 interpolated = interpolated.view(
@@ -150,7 +193,7 @@ class EoMT(nn.Module):
                 attn_mask[
                     :,
                     : self.num_q,
-                    self.num_q + self.encoder.backbone.num_prefix_tokens :,
+                    self.num_q + self.num_prefix_tokens :,
                 ] = (
                     interpolated > 0
                 )
@@ -161,12 +204,23 @@ class EoMT(nn.Module):
                     ],
                 )
 
-            x = x + block.drop_path1(
-                block.ls1(self._attn(block.attn, block.norm1(x), attn_mask))
-            )
-            x = x + block.drop_path2(block.ls2(block.mlp(block.norm2(x))))
+                # 使用自定义的attention来处理mask，遵循DINOv3的block结构
+                # 使用我们的_attn方法来处理masked attention，同时应用RoPE
+                x = x + block.ls1(
+                    self._attn(block.attn, block.norm1(x), attn_mask, rope_or_rope_list)
+                )
+                x = x + block.ls2(block.mlp(block.norm2(x)))
+            else:
+                # 没有mask时，直接使用DINOv3的block forward
+                x = block(x, rope_or_rope_list)
 
-        mask_logits, class_logits = self._predict(self.encoder.backbone.norm(x))
+        # 最终预测
+        if hasattr(self.encoder.backbone, 'norm'):
+            final_x = self.encoder.backbone.norm(x)
+        else:
+            final_x = x
+            
+        mask_logits, class_logits = self._predict(final_x)
         mask_logits_per_layer.append(mask_logits)
         class_logits_per_layer.append(class_logits)
 
