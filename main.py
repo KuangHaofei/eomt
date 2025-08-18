@@ -169,7 +169,8 @@ def cli_main():
                 LearningRateMonitor(logging_interval="epoch"),
             ],
             "devices": 1,
-            "gradient_clip_val": 0.01,
+            # "gradient_clip_val": 0.01,
+            "gradient_clip_val": 1.0,  # 增加梯度裁剪阈值，提高训练稳定性
             "gradient_clip_algorithm": "norm",
         },
     )

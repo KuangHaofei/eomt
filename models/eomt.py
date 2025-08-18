@@ -122,7 +122,21 @@ class EoMT(nn.Module):
         # DINOv3没有fused_attn属性，使用标准attention计算
         attn = (q @ k.transpose(-2, -1)) * module.scale
         if mask is not None:
-            attn = attn.masked_fill(~mask, float("-inf"))
+            # 数值稳定性改进：使用更安全的mask填充值
+            min_value = torch.finfo(attn.dtype).min
+            attn = attn.masked_fill(~mask, min_value)
+        
+        # 检查attention矩阵是否包含全部-inf的行（数值稳定性检查）
+        if mask is not None:
+            # 如果某行全为False，则该行在softmax后会变为NaN
+            # 检查是否存在全为False的mask行
+            all_masked = (~mask).all(dim=-1, keepdim=True)
+            if all_masked.any():
+                # 对于全被mask的行，我们给第一个位置一个小的正值
+                attn = torch.where(all_masked.expand_as(attn), 
+                                 torch.full_like(attn, min_value).scatter(-1, torch.zeros_like(attn[..., :1]).long(), -1e4), 
+                                 attn)
+        
         attn = F.softmax(attn, dim=-1)
         attn = module.attn_drop(attn)
         x = attn @ v

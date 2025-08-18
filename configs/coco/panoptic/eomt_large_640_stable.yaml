@@ -1,0 +1,44 @@
+trainer:
+  max_epochs: 12
+  logger:
+    class_path: lightning.pytorch.loggers.wandb.WandbLogger
+    init_args:
+      resume: allow
+      project: "eomt"
+      name: "coco_panoptic_eomt_large_640_stable"
+model:
+  class_path: training.mask_classification_panoptic.MaskClassificationPanoptic
+  init_args:
+    # 数值稳定性改进的超参数
+    lr: 5e-5  # 降低学习率，提高训练稳定性
+    llrd: 0.9  # 稍微增加layer-wise learning rate decay
+    weight_decay: 0.01  # 降低权重衰减，减少梯度消失风险
+    
+    # Attention mask annealing设置（更保守的策略）
+    attn_mask_annealing_enabled: True
+    attn_mask_annealing_start_steps: [14782, 29564, 44346, 59128]
+    attn_mask_annealing_end_steps: [29564, 44346, 59128, 73910]
+    
+    # 损失函数权重调整（降低mask损失权重，提高稳定性）
+    mask_coefficient: 3.0  # 从5.0降低到3.0
+    dice_coefficient: 3.0  # 从5.0降低到3.0
+    class_coefficient: 2.0  # 保持不变
+    no_object_coefficient: 0.1  # 保持不变
+    
+    # 其他稳定性相关参数
+    poly_power: 0.9
+    warmup_steps: [1000, 2000]  # 增加warmup步数
+    
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_q: 200
+        encoder:
+          class_path: models.vit.ViT
+data:
+  class_path: datasets.coco_panoptic.COCOPanoptic
+  init_args:
+    stuff_classes: [80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132]
+    # 数据加载稳定性改进
+    check_empty_targets: True  # 确保检查空目标
+    scale_range: [0.5, 1.5]  # 减少数据增强的极端情况

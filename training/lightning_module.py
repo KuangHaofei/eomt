@@ -171,16 +171,42 @@ class LightningModule(lightning.LightningModule):
         for i, (mask_logits, class_logits) in enumerate(
             list(zip(mask_logits_per_block, class_logits_per_block))
         ):
+            # 数值稳定性检查
+            if torch.isnan(mask_logits).any() or torch.isinf(mask_logits).any():
+                self.print(f"警告: mask_logits在block {i}中包含NaN或Inf值")
+                mask_logits = torch.where(torch.isnan(mask_logits) | torch.isinf(mask_logits), 
+                                        torch.zeros_like(mask_logits), mask_logits)
+            
+            if torch.isnan(class_logits).any() or torch.isinf(class_logits).any():
+                self.print(f"警告: class_logits在block {i}中包含NaN或Inf值")
+                class_logits = torch.where(torch.isnan(class_logits) | torch.isinf(class_logits), 
+                                         torch.zeros_like(class_logits), class_logits)
+            
             losses = self.criterion(
                 masks_queries_logits=mask_logits,
                 class_queries_logits=class_logits,
                 targets=targets,
             )
+            
+            # 检查损失值
+            for loss_key, loss_value in losses.items():
+                if torch.isnan(loss_value) or torch.isinf(loss_value):
+                    self.print(f"警告: {loss_key}损失在block {i}中为NaN或Inf，设置为0")
+                    losses[loss_key] = torch.tensor(0.0, device=loss_value.device, requires_grad=True)
+            
             block_postfix = self.block_postfix(i)
             losses = {f"{key}{block_postfix}": value for key, value in losses.items()}
             losses_all_blocks |= losses
 
-        return self.criterion.loss_total(losses_all_blocks, self.log)
+        # return self.criterion.loss_total(losses_all_blocks, self.log)
+        total_loss = self.criterion.loss_total(losses_all_blocks, self.log)
+        
+        # 最终损失检查
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            self.print("警告: 总损失为NaN或Inf，跳过此batch")
+            return torch.tensor(0.0, device=total_loss.device, requires_grad=True)
+        
+        return total_loss
 
     def validation_step(self, batch, batch_idx=0):
         return self.eval_step(batch, batch_idx, "val")

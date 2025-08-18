@@ -30,7 +30,7 @@ class ViT(nn.Module):
         # )
 
         # 权重文件路径
-        weights_path = '/home/ipbhk/data/projects/eomt/models/dinov3/weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth'
+        weights_path = '/home/hkuang_hpc/eomt/models/dinov3/weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth'
         
         try:
             # 直接使用DINOv3的函数，传入正确的img_size
